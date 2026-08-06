@@ -1,0 +1,279 @@
+1. the Rule-Based Decision Support Code :
+
+import json
+import time
+import os
+import subprocess
+from datetime import datetime
+import paramiko
+
+ALERTS_FILE_PATH = "/var/ossec/logs/alerts/alerts.json"
+WHITELIST_IPS = ["10.10.10.1", "192.168.1.100"]  # قائمة الـ IPs الموثوقة لمنع الـ False Positive
+LOG_DECISIONS_FILE = "/var/ossec/logs/alerts/decision_support_output.json"
+
+def execute_active_response_block(ip):
+
+    PFSENSE_IP = "10.10.10.1"      
+    PFSENSE_USER = "admin"           
+    PFSENSE_PASS = "pfsense"         
+    WAN_INTERFACE = "wan"           
+    try:
+        print(f"[*] Attempting to block IP {ip} on pfSense via SSH...")
+        
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(PFSENSE_IP, username=PFSENSE_USER, password=PFSENSE_PASS, timeout=5)
+        
+        command = f"easyrule block {WAN_INTERFACE} {ip}"
+        
+        stdin, stdout, stderr = ssh.exec_command(command)
+        
+        output = stdout.read().decode().strip()
+        error = stderr.read().decode().strip()
+        
+        ssh.close()
+        
+        if error:
+            print(f"[-] pfSense Error: {error}")
+        else:
+            print(f"[+] pfSense Response: {output}")
+            print(f"[{datetime.now()}] [ACTIVE RESPONSE] IP {ip} blocked successfully on pfSense firewall.")
+            
+    except Exception as e:
+        print(f"[-] Failed to execute block on pfSense for IP {ip}: {e}")
+
+def log_decision_result(decision_data):
+
+    try:
+        with open(LOG_DECISIONS_FILE, "a") as f:
+            f.write(json.dumps(decision_data) + "\n")
+    except Exception as e:
+        print(f"Error logging decision: {e}")
+
+def evaluate_alert_decision(alert_json):
+
+    rule_info = alert_json.get("rule", {})
+    rule_id = str(rule_info.get("id"))
+    level = int(rule_info.get("level", 0))
+    groups = rule_info.get("groups", [])
+    description = rule_info.get("description", "").lower()
+    
+    # استخراج الـ IP الخاص بالمهاجم
+    src_ip = alert_json.get("data", {}).get("srcip", "unknown")
+
+    # 1. الامتثال لقاعدة الـ Whitelist (مبدأ استمرارية الأعمال ومنع الـ Denial of Service الذاتي)
+    if src_ip in WHITELIST_IPS:
+        return {
+            "decision": "LOW / BYPASS",
+            "action": "IGNORE_EVENT",
+            "reason": "Traffic from whitelisted administrative IP. Automated blocking bypassed to preserve business continuity."
+        }
+
+    # 2. قواعد دعم القرار (Decision Logic) بناءً على نوع التهديد وسياقه:
+    
+    # الفئة الأولى: الـ Command Injection (Critical - حظر فوري دائماً)
+    if "command" in description or rule_id in ["100102", "100208"]:
+        return {
+            "decision": "CRITICAL THREAT",
+            "action": "IMMEDIATE_AUTO_BLOCK",
+            "reason": f"Remote Code Execution (RCE) via Command Injection detected (Rule {rule_id}). "
+                      f"CVSS v3.1 rates this vector as CRITICAL (Score: 9.8) because it allows complete OS take-over. "
+                      f"Immediate firewall containment executed."
+        }
+
+    # الفئة الثانية: الهجمات متعددة المتجهات (Critical - حظر فوري)
+    elif level == 12 and "correlation" in groups:
+        return {
+            "decision": "CRITICAL THREAT",
+            "action": "IMMEDIATE_AUTO_BLOCK",
+            "reason": f"Multi-Vector Attack chain detected (Rule{rule_id}: '{rule_info.get('description')}'). "
+                      f"Per Cyber Kill Chain methodology, shifting between different exploit methodologies (XSS/SQLi) "
+                      f"confirms a high-confidence targeted penetration attempt. Machine-speed mitigation required."
+        }
+
+    # الفئة الثالثة: تكرار هجمات الـ SQLi أو الـ XSS (High - تعليق بانتظار موافقة بشرية)
+    elif level == 10 and "correlation" in groups:
+        return {
+            "decision": "HIGH THREAT",
+            "action": "PENDING_ADMIN_APPROVAL",
+            "reason": f"Repetitive web scanning/exploitation attempts detected (Rule {rule_id}). "
+                      f"OWASP Risk Methodology dictates high likelihood of success due to frequency. "
+                      f"Deferred to Dashboard for human validation to rule out potential NAT/Proxy false positives."
+        }
+# الفئة الرابعة: الهجمات المنفردة العادية (Medium - مراقبة فقط)
+    elif level == 7:
+        return {
+            "decision": "MEDIUM THREAT",
+            "action": "LOG_AND_MONITOR",
+            "reason": f"Isolated single event web attack (Rule {rule_id}). "
+                      f"NIST SP 800-61 r2 triage guidelines advise logging single vectors "
+                      f"to minimize business disruption while awaiting further contextual correlation."
+        }
+
+    # لأي تنبيهات عامة أخرى في النظام
+    else:
+        return {
+            "decision": "INFORMATIONAL",
+            "action": "LOG_EVENT",
+            "reason": f"Standard system alert with level {level}. No tactical action required."
+        }
+
+def follow_alerts_file():
+
+    print(f"[*] Decision Support System Started. Monitoring: {ALERTS_FILE_PATH}...")
+    
+    while not os.path.exists(ALERTS_FILE_PATH):
+        time.sleep(1)
+        
+    with open(ALERTS_FILE_PATH, "r") as f:
+        f.seek(0, os.SEEK_END)
+        
+        while True:
+            line = f.readline()
+            if not line:
+                time.sleep(0.1)  
+                continue
+                
+            try:
+                alert_json = json.loads(line)
+                
+                analysis = evaluate_alert_decision(alert_json)
+                
+                # صياغة المخرج النهائي المتكامل
+                decision_output = {
+                    "timestamp": datetime.now().isoformat(),
+                    "attacker_ip": alert_json.get("data", {}).get("srcip", "unknown"),
+                    "wazuh_rule_id": alert_json.get("rule", {}).get("id"),
+                    "attack_type": alert_json.get("rule", {}).get("description"),
+                    "decision_level": analysis["decision"],
+                    "recommended_action": analysis["action"],
+                    "scientific_justification": analysis["reason"]
+                }
+                
+                print(f"[{decision_output['decision_level']}] IP: {decision_output['attacker_ip']} -> Action: {decision_output['recommended_action']}")
+                
+                log_decision_result(decision_output)
+                
+                # تنفيذ الحظر التلقائي الفوري إن لزم الأمر
+                if decision_output["recommended_action"] == "IMMEDIATE_AUTO_BLOCK":
+                    execute_active_response_block(decision_output["attacker_ip"])
+                    
+            except json.JSONDecodeError:
+                continue
+            except Exception as e:
+                print(f"Error processing line: {e}")
+
+if name == '__main__':
+    follow_alerts_file()
+
+2. the custom decoders :
+
+<decoder name="ModSec-log">
+  <prematch>ModSecurity:</prematch>
+</decoder>
+
+<decoder name="ModSec-ip">
+  <parent>ModSec-log</parent>
+  <regex>client (\d+.\d+.\d+.\d+)</regex>
+  <order>srcip</order>
+</decoder>
+
+<decoder name="ModSec-fields">
+  <parent>ModSec-log</parent>
+  <regex>id "\d+"\.+msg "(.+)"\.+data "(.+)"</regex>
+  <order>modsec_id, modsec_msg, modsec_data</order>
+</decoder>
+
+3. the custom rules :
+
+<group name="modsec,attacks,web_attacks">
+
+
+  <rule id="100100" level="7">
+    <decoded_as>ModSec-log</decoded_as>
+    <match>942100</match>
+    <description>SQL injection detected (ModSecurity)</description>
+    <group>,modsecurity,sqli,sqli_xss,web_attack,sqli_cmdinj,</group>
+  </rule>
+
+  <rule id="100101" level="7">
+    <decoded_as>ModSec-log</decoded_as>
+    <match>941160</match>
+    <description>cross Site Scripting -XSS- detected (ModSecurity)</description>
+    <group>,modsecurity,xss,sqli_xss,web_attack,xss_cmdinj,</group>
+  </rule>
+
+  <rule id="100102" level="12">
+    <decoded_as>ModSec-log</decoded_as>
+    <match>932105</match>
+    <description>Command injection detected (ModSecurity)</description>
+    <group>,modsecurity,command_injection,sqli_cmdinj,web_attack,xss_cmdinj,</group>
+  </rule>
+
+</group>
+
+
+<group name="modsec,correlation">
+
+
+  <rule id="100200" level="12" timeframe="30">>
+    <if_sid>100100</if_sid>
+    <if_matched_sid>100101</if_matched_sid>
+    <same_source_ip />
+    <description>Multi-Vector Attack: XSS then SQLI, check rules: 100100, 100101 for more details</description>
+  </rule>
+
+  <rule id="100201" level="12" timeframe="30">>
+    <if_sid>100101</if_sid>
+    <if_matched_sid>100100</if_matched_sid>
+    <same_source_ip />
+    <description>Multi-Vector Attack: SQI then XSS, check rules: 100100, 100101</description>
+  </rule>
+
+  <rule id="100202" level="12" timeframe="30">>
+    <if_sid>100102</if_sid>
+    <if_matched_sid>100100</if_matched_sid>
+    <same_source_ip />
+    <description>Multi-Vector Attack: SQLI then COMMAND INJECTION, check rules: 100100, 100102</description>
+  </rule>
+
+  <rule id="100203" level="12" timeframe="30">>
+    <if_sid>100100</if_sid>
+    <if_matched_sid>100102</if_matched_sid>
+    <same_source_ip />
+    <description>Multi-Vector Attack: COMMAND INJECTION then SQLI, check rules: 100100, 100102</description>
+  </rule>
+
+  <rule id="100204" level="12" timeframe="30">>
+    <if_sid>100101</if_sid>
+    <if_matched_sid>100102</if_matched_sid>
+    <same_source_ip />
+    <description>Multi-Vector Attack: COMMAND INJECTION then XSS, check rules: 100100, 100101</description>
+  </rule>
+
+  <rule id="100205" level="12" timeframe="30">>
+    <if_sid>100102</if_sid>
+    <if_matched_sid>100101</if_matched_sid>
+    <same_source_ip />
+    <description>Multi-Vector Attack: XSS then COMMAND INJECTION, check rules: 1300100, 100101</description>
+  </rule>
+
+  <rule id="100206" level="10" frequency="2" timeframe="30">
+    <if_matched_sid>100100</if_matched_sid>
+    <same_source_ip />
+    <description>Multiple SQL injection attemptsfrom same ip</description>
+  </rule>
+
+  <rule id="100207" level="10" frequency="2" timeframe="30">
+    <if_matched_sid>100101</if_matched_sid>
+    <same_source_ip />
+    <description>Multiple XSS attack attempts from same ip</description>
+  </rule>
+
+ <rule id="100208" level="10" frequency="2" timeframe="30">
+    <if_matched_sid>100102</if_matched_sid>
+    <same_source_ip />
+    <description>Multiple command injection attemptsfrom same ip</description>
+ </rule>
+
+</group>
